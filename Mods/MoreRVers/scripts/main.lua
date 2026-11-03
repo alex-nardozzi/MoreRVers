@@ -1,237 +1,274 @@
 -- MoreRVers - main.lua
--- Host-side UE4SS Lua mod to raise multiplayer cap beyond 4 for RV There Yet?
+-- Host-side UE4SS Lua mod that raises the multiplayer cap of RV There Yet?
+--
+-- How the game enforces the cap (game build 1.4, UE 5.6):
+--   ARGGameSession (the game's native session class) reads the cap from
+--   GetDefault<AGameSession>()->MaxPlayers, i.e. the *engine base class* default
+--   object /Script/Engine.Default__GameSession, in three places:
+--     * ApproveLogin       -> rejects with "Session is full." once players >= cap
+--     * InitOptions        -> copies it onto the live session (overwrites live edits)
+--     * UpdateSessionSettings -> lobby slots. The Steam lobby is created with a
+--       hard-coded 4 slots, but the game updates it right after the host enters
+--       the map, and the engine then calls SetLobbyMemberLimit with this value.
+--   So the value that matters is Default__GameSession.MaxPlayers. Patching only
+--   the live GameSession, or the CDO of its subclass, has no effect anymore.
+--
+--   Levels can also carry ARGWorldSettings.MaxPlayersOverride (0 = no override).
+--   If a level sets it below the target cap it is raised as well.
 
--- Set up package path for this mod's directory structure
-local ModPath = debug.getinfo(1, "S").source:match("@?(.*/)")
-if not ModPath then
-  -- Try Windows path separator
-  ModPath = debug.getinfo(1, "S").source:match("@?(.*)[\\/]")
-  if ModPath then ModPath = ModPath .. "\\" end
+local VERSION = "1.1.0"
+local HARD_MAX = 24
+local DEFAULT_CAP = 8
+local SESSION_CDO_PATH = "/Script/Engine.Default__GameSession"
+
+local function log(level, msg)
+  print(string.format("[MoreRVers] [%s] %s\n", level, tostring(msg)))
 end
 
-local MoreRVers = {
-  Name = "MoreRVers",
-  Version = "1.0.0",
-  Metrics = {
-    forcedAllows = 0,
-  }
-}
+----------------------------------------------------------------------------
+-- Config
+----------------------------------------------------------------------------
 
--- ModPath detection (silent unless there's an issue)
-if not ModPath then
-  print("[MoreRVers] WARNING: ModPath not detected - hooks may fail to load!")
+local function script_dir()
+  local src = debug.getinfo(1, "S").source or ""
+  src = src:gsub("^@", ""):gsub("\\", "/")
+  return src:match("^(.*/)") -- nil if no directory part
 end
 
--- Simple INI file parser (reads MaxPlayers value)
-local function parse_ini(filepath)
-  local file = io.open(filepath, "r")
-  if not file then return nil end
-  
-  local maxPlayers = nil
-  for line in file:lines() do
-    -- Skip comments and empty lines
-    line = line:match("^%s*(.-)%s*$")
-    if line ~= "" and not line:match("^;") then
-      -- Parse MaxPlayers = value
-      local key, value = line:match("^([^=]+)%s*=%s*(.+)$")
-      if key and value then
-        key = key:match("^%s*(.-)%s*$")
-        value = value:match("^%s*(.-)%s*$")
-        
-        if key == "MaxPlayers" and tonumber(value) then
-          maxPlayers = tonumber(value)
-          break
-        end
+local function read_cap()
+  local dir = script_dir()
+  if not dir then
+    log("WARN", "Could not locate the mod folder; using MaxPlayers = " .. DEFAULT_CAP)
+    return DEFAULT_CAP
+  end
+  local path = dir .. "../config.ini"
+  local f = io.open(path, "r")
+  if not f then
+    log("WARN", "Could not open " .. path .. "; using MaxPlayers = " .. DEFAULT_CAP)
+    return DEFAULT_CAP
+  end
+  local value
+  for line in f:lines() do
+    line = line:gsub("^\239\187\191", "")   -- UTF-8 BOM
+    line = line:gsub("%s*[;#].*$", "")       -- comments
+    local key, v = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+    if key and key:lower() == "maxplayers" then
+      value = tonumber(v)
+      break
+    end
+  end
+  f:close()
+  if not value then
+    log("WARN", "MaxPlayers not found in config.ini; using " .. DEFAULT_CAP)
+    return DEFAULT_CAP
+  end
+  value = math.floor(value)
+  if value < 1 then value = 1 end
+  if value > HARD_MAX then value = HARD_MAX end
+  return value
+end
+
+local CAP = read_cap()
+
+----------------------------------------------------------------------------
+-- Helpers
+----------------------------------------------------------------------------
+
+local function is_valid(obj)
+  if obj == nil then return false end
+  local ok, res = pcall(function() return obj:IsValid() end)
+  return ok and res == true
+end
+
+local function name_of(obj)
+  local ok, n = pcall(function() return obj:GetFullName() end)
+  return ok and n or "<object>"
+end
+
+local function read_int(obj, prop)
+  local ok, v = pcall(function() return obj[prop] end)
+  if ok and type(v) == "number" then return v end
+  return nil
+end
+
+-- Writes obj[prop] = value and reads it back. Returns true if the value stuck.
+local function write_int(obj, prop, value, why)
+  local before = read_int(obj, prop)
+  if before == nil then return false end
+  if before == value then return true end
+  local ok, err = pcall(function() obj[prop] = value end)
+  local after = read_int(obj, prop)
+  if ok and after == value then
+    log("INFO", string.format("%s %d -> %d (%s) %s", prop, before, value, why, name_of(obj)))
+    return true
+  end
+  log("WARN", string.format("Failed to set %s on %s (%s): %s", prop, name_of(obj), why,
+    tostring(err or ("read back " .. tostring(after)))))
+  return false
+end
+
+----------------------------------------------------------------------------
+-- Patching
+----------------------------------------------------------------------------
+
+local base_cdo_patched = false
+
+-- The value the game actually enforces.
+local function patch_base_cdo(why)
+  local cdo = StaticFindObject(SESSION_CDO_PATH)
+  if not is_valid(cdo) then return false end
+  local ok = write_int(cdo, "MaxPlayers", CAP, why)
+  if ok and not base_cdo_patched then
+    base_cdo_patched = true
+    log("INFO", "Session cap is now " .. CAP .. " players")
+  end
+  return ok
+end
+
+-- Live session plus the CDO of its own (sub)class, for engine code paths that use them.
+local function patch_session(session, why)
+  if not is_valid(session) then return end
+  write_int(session, "MaxPlayers", CAP, why)
+  local ok, cdo = pcall(function() return session:GetClass():GetCDO() end)
+  if ok and is_valid(cdo) then
+    write_int(cdo, "MaxPlayers", CAP, why .. "/class default")
+  end
+end
+
+-- Per-level override: only raise it when a level sets it below our target.
+local function patch_world_settings(why)
+  local list = FindAllOf("RGWorldSettings")
+  if not list then return end
+  for _, ws in ipairs(list) do
+    if is_valid(ws) then
+      local v = read_int(ws, "MaxPlayersOverride")
+      if v and v > 0 and v < CAP then
+        write_int(ws, "MaxPlayersOverride", CAP, why)
       end
     end
   end
-  
-  file:close()
-  return maxPlayers
 end
 
--- Load config from INI file
-local configLoaded = nil
-if ModPath then
-  local iniPath = ModPath .. "../config.ini"
-  local ok, maxPlayers = pcall(function() return parse_ini(iniPath) end)
-  if ok and maxPlayers then
-    configLoaded = {
-      TargetMaxPlayers = maxPlayers,
-      HardUpperLimit = 24,
-      EnableClientUiTweaks = false,
-      LogLevel = "INFO",
-      TimestampFormat = "%H:%M:%S"
-    }
+local function patch_all(why)
+  patch_base_cdo(why)
+  local sessions = FindAllOf("GameSession")
+  if sessions then
+    for _, s in ipairs(sessions) do patch_session(s, why) end
   end
+  patch_world_settings(why)
 end
 
-MoreRVers.Config = configLoaded or {
-  TargetMaxPlayers = 8,
-  HardUpperLimit = 24,
-  EnableClientUiTweaks = false,
-  LogLevel = "INFO",
-  TimestampFormat = "%H:%M:%S"
-}
-
--- Logging utilities with levels and timestamps
-local LEVELS = { DEBUG = 10, INFO = 20, WARN = 30, ERROR = 40 }
-local CURRENT_LEVEL = LEVELS[MoreRVers.Config.LogLevel or "INFO"] or LEVELS.INFO
-
-local function ts()
-  local fmt = MoreRVers.Config.TimestampFormat or "%H:%M:%S"
-  local ok, s = pcall(function() return os.date(fmt) end)
-  return ok and s or "--:--:--"
+local function safe(why, fn)
+  local ok, err = pcall(fn)
+  if not ok then log("ERROR", "[" .. why .. "] " .. tostring(err)) end
 end
 
-local function println(level, msg)
-  local lvl = level or "INFO"
-  print(string.format("[%s] [%s] [%s] %s", ts(), MoreRVers.Name, lvl, tostring(msg)))
-end
+----------------------------------------------------------------------------
+-- Triggers
+----------------------------------------------------------------------------
 
-function MoreRVers.Debug(msg)
-  if LEVELS.DEBUG >= CURRENT_LEVEL then println("DEBUG", msg) end
-end
-
-function MoreRVers.Log(msg)
-  if LEVELS.INFO >= CURRENT_LEVEL then println("INFO", msg) end
-end
-
-function MoreRVers.Warn(msg)
-  if LEVELS.WARN >= CURRENT_LEVEL then println("WARN", msg) end
-end
-
-function MoreRVers.Error(msg)
-  if LEVELS.ERROR >= CURRENT_LEVEL then println("ERROR", msg) end
-end
-
--- Clamp and sanitize target cap
-local function sanitize_target_cap(v)
-  local num = tonumber(v) or 8
-  if num < 1 then num = 1 end  -- Allow as low as 1 for testing
-  local hard = tonumber(MoreRVers.Config.HardUpperLimit or 24) or 24
-  if num > hard then num = hard end
-  return num
-end
-
-MoreRVers.TargetMaxPlayers = sanitize_target_cap(MoreRVers.Config.TargetMaxPlayers)
-
--- Engine/game info (best-effort)
-local function get_engine_info()
-  local info = "UE5 (detected)"
-  local ok, ver = pcall(function()
-    if UE ~= nil and UE.UObject and UE.UObject.GetEngineVersion then
-      return UE.UObject.GetEngineVersion()
-    end
-    return nil
-  end)
-  if ok and ver then
-    info = tostring(ver)
-  end
-  return info
-end
-
--- Require hook modules with fallbacks that work across common UE4SS layouts
-local function require_hook(name)
-  -- Try loading relative to current script location using dofile
-  if ModPath then
-    local hookPath = ModPath .. "hooks\\" .. name .. ".lua"
-    local ok, result = pcall(function() return dofile(hookPath) end)
-    if ok and result then
-      return result
-    end
-  end
-  
-  -- Fallback to require with various paths
-  return try_require({
-    "hooks." .. name,
-    "scripts.hooks." .. name,
-    "Mods.MoreRVers.scripts.hooks." .. name,
-  })
-end
-
--- Initialization log header
-MoreRVers.Log(("MoreRVers v%s loading. Target cap=%d (hard max %d)")
-  :format(MoreRVers.Version, MoreRVers.TargetMaxPlayers, MoreRVers.Config.HardUpperLimit))
-MoreRVers.Log("Engine: " .. get_engine_info())
-
--- Load hooks
-local game_session = require_hook("game_session")
-local join_gate = require_hook("join_gate")
-local ui_helpers = nil
-if MoreRVers.Config.EnableClientUiTweaks then
-  ui_helpers = require_hook("ui_helpers")
-end
-
--- Defensive guards
-if not game_session then
-  MoreRVers.Warn("game_session hook module not found; MaxPlayers may remain vanilla.")
-else
-  -- Defer hook installation until UE API is ready
-  if UE then
-    -- Apply MaxPlayers bump as early as possible
-    local ok, err = pcall(function()
-      game_session.install_hooks(MoreRVers)
-      if game_session.get_current_player_count then
-        MoreRVers.get_current_player_count = game_session.get_current_player_count
-      end
-    end)
-    if not ok then
-      MoreRVers.Error("Failed to install game_session hooks: " .. tostring(err))
-    end
-  else
-    -- UE API not ready - patch GameSession directly when created
-    NotifyOnNewObject("/Script/Engine.GameSession", function(obj)
-      -- Read original value
-      local original = nil
-      pcall(function() original = obj.MaxPlayers end)
-      
-      -- Set new value directly
-      local okSet = pcall(function() 
-        obj.MaxPlayers = MoreRVers.TargetMaxPlayers 
-      end)
-      
-      if okSet then
-        MoreRVers.Log(string.format("Applied MaxPlayers override: %s → %d", 
-          tostring(original or "?"), MoreRVers.TargetMaxPlayers))
-        
-        -- Try to set on CDO too
-        pcall(function()
-          local cdo = obj:GetClass():GetDefaultObject()
-          if cdo then
-            cdo.MaxPlayers = MoreRVers.TargetMaxPlayers
-          end
+-- 1) As early as possible. The engine class default object usually exists
+--    already; if not, retry once a second until it does.
+safe("startup", function()
+  if not patch_base_cdo("startup") then
+    local queued = false
+    LoopAsync(1000, function()
+      if base_cdo_patched then return true end -- stop the loop
+      if not queued then
+        queued = true
+        ExecuteInGameThread(function()
+          safe("startup retry", function() patch_base_cdo("startup retry") end)
+          queued = false
         end)
-      else
-        MoreRVers.Warn("Failed to set MaxPlayers on GameSession")
       end
+      return false
     end)
   end
-end
+end)
 
-if join_gate then
-  local ok, err = pcall(function()
-    join_gate.install_hooks(MoreRVers)
+-- 2) Whenever a GameSession is spawned (hosting, map travel). Runs before the
+--    session's InitOptions copies the default value onto it.
+safe("register NotifyOnNewObject", function()
+  NotifyOnNewObject("/Script/Engine.GameSession", function(session)
+    safe("new GameSession", function()
+      patch_base_cdo("GameSession spawned")
+      patch_session(session, "GameSession spawned")
+    end)
   end)
-  if not ok then
-    MoreRVers.Error("Failed to install join_gate hooks: " .. tostring(err))
-  end
-end
+end)
 
-if ui_helpers then
-  local ok, err = pcall(function()
-    ui_helpers.install_hooks(MoreRVers)
+-- 3) After the game mode has initialized (InitOptions has run by now).
+safe("register InitGameState hook", function()
+  RegisterInitGameStatePostHook(function(ctx)
+    safe("InitGameState", function()
+      local gm = ctx:get()
+      patch_base_cdo("game initialized")
+      if is_valid(gm) then patch_session(gm.GameSession, "game initialized") end
+      patch_world_settings("game initialized")
+    end)
   end)
-  if not ok then
-    MoreRVers.Warn("UI helpers failed to load (non-fatal): " .. tostring(err))
+end)
+
+-- 4) After every map load (world settings of the new level exist now).
+safe("register LoadMap hook", function()
+  RegisterLoadMapPostHook(function()
+    safe("LoadMap", function() patch_all("map loaded") end)
+  end)
+end)
+
+----------------------------------------------------------------------------
+-- Diagnostics: F10 in game, or "morervers" in the UE4SS console
+----------------------------------------------------------------------------
+
+local function diagnostics()
+  log("INFO", "v" .. VERSION .. " target MaxPlayers = " .. CAP)
+  local cdo = StaticFindObject(SESSION_CDO_PATH)
+  if is_valid(cdo) then
+    log("INFO", "Default__GameSession.MaxPlayers = " .. tostring(read_int(cdo, "MaxPlayers")) .. " (this is the enforced cap)")
+  else
+    log("WARN", "Default__GameSession not found")
   end
-else
-  if MoreRVers.Config.EnableClientUiTweaks then
-    MoreRVers.Warn("UI helpers module not found; continuing without client tweaks.")
+  local sessions = FindAllOf("GameSession") or {}
+  for _, s in ipairs(sessions) do
+    if is_valid(s) then
+      log("INFO", "live MaxPlayers = " .. tostring(read_int(s, "MaxPlayers")) .. "  " .. name_of(s))
+    end
   end
+  if #sessions == 0 then log("INFO", "No live GameSession (host a game first)") end
+  -- World partition creates one RGWorldSettings per streamed cell; only report real overrides.
+  local total, overrides = 0, 0
+  for _, ws in ipairs(FindAllOf("RGWorldSettings") or {}) do
+    if is_valid(ws) then
+      total = total + 1
+      local v = read_int(ws, "MaxPlayersOverride")
+      if v and v > 0 then
+        overrides = overrides + 1
+        log("INFO", "MaxPlayersOverride = " .. v .. "  " .. name_of(ws))
+      end
+    end
+  end
+  log("INFO", string.format("RGWorldSettings: %d found, %d with a MaxPlayersOverride", total, overrides))
 end
 
--- Export for other scripts
-return MoreRVers
+safe("register F10", function()
+  RegisterKeyBind(Key.F10, function()
+    ExecuteInGameThread(function()
+      safe("F10", function()
+        patch_all("F10")
+        diagnostics()
+      end)
+    end)
+  end)
+end)
 
+safe("register console command", function()
+  RegisterConsoleCommandHandler("morervers", function()
+    safe("console", function()
+      patch_all("console")
+      diagnostics()
+    end)
+    return true
+  end)
+end)
 
+log("INFO", "v" .. VERSION .. " loaded. Target MaxPlayers = " .. CAP .. " (F10 = status)")

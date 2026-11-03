@@ -1,6 +1,6 @@
 # MoreRVers - Multiplayer Expansion Mod for RV There Yet?
 
-![Version](https://img.shields.io/badge/version-1.0.1-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![Game](https://img.shields.io/badge/game-RV%20There%20Yet%3F-orange)
 ![Modloader](https://img.shields.io/badge/modloader-UE4SS-purple)
 
@@ -61,11 +61,7 @@ Use this if you already have UE4SS experimental installed and configured.
    ```
    <Steam>\steamapps\common\Ride\Ride\Binaries\Win64\ue4ss\Mods\
    ```
-3. Enable the mod by editing `ue4ss\Mods\mods.txt`:
-   ```
-   MoreRVers : 1
-   ```
-   Note: Add this line before `Keybinds : 1`
+3. The mod ships with an `enabled.txt`, so UE4SS loads it automatically. (Alternatively add `MoreRVers : 1` to `ue4ss\Mods\mods.txt`, before `Keybinds : 1`.)
 4. Configure the player limit in `ue4ss\Mods\MoreRVers\config.ini`:
    ```ini
    MaxPlayers = 8
@@ -113,12 +109,26 @@ The game must be restarted for configuration changes to take effect.
 
 ## Verification
 
-Successful installation can be verified by checking the UE4SS console for the following messages:
+Successful installation can be verified by checking the UE4SS console (or `ue4ss\UE4SS.log`) for:
 
 ```
-[MoreRVers] [INFO] MoreRVers v1.0.0 loading. Target cap=8 (hard max 24)
-[MoreRVers] [INFO] Applied MaxPlayers override: 4 → 8
+[MoreRVers] [INFO] MaxPlayers 4 -> 8 (startup) GameSession /Script/Engine.Default__GameSession
+[MoreRVers] [INFO] Session cap is now 8 players
+[MoreRVers] [INFO] v1.1.0 loaded. Target MaxPlayers = 8 (F10 = status)
 ```
+
+Press **F10** in game (or type `morervers` in the UE4SS console) to print the current cap values.
+`Default__GameSession.MaxPlayers` is the value the game enforces.
+
+## How it works
+
+Since game version 1.4 the game's own session class (`RGGameSession`) takes the player cap from the
+engine's `GameSession` class default object (`/Script/Engine.Default__GameSession`): it uses it to
+reject joins ("Session is full."), to size the lobby, and it copies it onto the live session every time
+a session starts. Earlier versions of this mod only changed the live session, which the game now
+overwrites, so the cap stayed at 4. The mod now patches that default object at startup and re-applies
+the cap on every session spawn, game-mode init and map load. If a level sets
+`RGWorldSettings.MaxPlayersOverride` below the target, that is raised too.
 
 ## Troubleshooting
 
@@ -131,7 +141,7 @@ Successful installation can be verified by checking the UE4SS console for the fo
 
 ### Player limit remains at 4
 
-- Check console for "Applied MaxPlayers override" confirmation message
+- Press F10 in game and check that `Default__GameSession.MaxPlayers` shows your configured value
 - Test with `MaxPlayers = 1` to verify mod functionality
 - Review `UE4SS-settings.ini` to ensure Lua scripting is enabled
 
