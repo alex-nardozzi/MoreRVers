@@ -8,6 +8,9 @@ A runtime mod that increases the multiplayer player cap beyond the default 4-pla
 
 **Only the host needs to install the mod.**
 
+> **Fork notice:** this is a maintained fork of [alex-nardozzi/MoreRVers](https://github.com/alex-nardozzi/MoreRVers),
+> updated for **game version 1.4** (tested on Linux/Proton). Versions 1.0.x stopped raising the cap after that update.
+
 ## Overview
 
 This mod patches the game's multiplayer cap at runtime, allowing you to host sessions with more than the default 4 players. The modification uses UE4SS for runtime patching without requiring binary editing or permanent game file changes.
@@ -67,6 +70,14 @@ Use this if you already have UE4SS experimental installed and configured.
    MaxPlayers = 8
    ```
 5. Launch the game and host a session
+
+### Linux / Steam Deck (Proton)
+
+Proton ignores the UE4SS loader unless you override it. In Steam, open the game's **Properties -> Launch Options** and enter:
+
+```
+WINEDLLOVERRIDES="dwmapi=n,b" %command%
+```
 
 ## File Tree
 When properly installed, your game directory should look similar to this:
@@ -141,6 +152,9 @@ the cap on every session spawn, game-mode init and map load. If a level sets
 
 ### Player limit remains at 4
 
+- Make sure you are on a build for game 1.4 or newer (mod v1.1.0+)
+- On Linux/Proton, check the `WINEDLLOVERRIDES` launch option above
+
 - Press F10 in game and check that `Default__GameSession.MaxPlayers` shows your configured value
 - Test with `MaxPlayers = 1` to verify mod functionality
 - Review `UE4SS-settings.ini` to ensure Lua scripting is enabled
@@ -153,7 +167,9 @@ the cap on every session spawn, game-mode init and map load. If a level sets
 
 ## Contributing
 
-Bug reports and feature suggestions can be submitted via GitHub Issues. Pull requests are welcome.
+Bug reports and feature suggestions can be submitted via [GitHub Issues](https://github.com/Gidan95/MoreRVers/issues) on this fork. Pull requests are welcome.
+
+When a game update breaks the mod, include `ue4ss\UE4SS.log` and the output of pressing **F10** in a hosted session.
 
 ## License
 
@@ -161,5 +177,7 @@ MIT License. See LICENSE file for details.
 
 ## Credits
 
+- **[alex-nardozzi](https://github.com/alex-nardozzi)** - original MoreRVers mod (this fork is based on v1.0.1)
+- **Gidan95** - game 1.4 update (v1.1.0)
 - **UE4SS Team** - Unreal Engine modding framework
 - **RV There Yet? Community** - Testing and feedback
